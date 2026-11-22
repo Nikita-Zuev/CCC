@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using Microsoft.Extensions.Configuration;
 
-namespace Lab06Variant1;
+namespace Lab07Variant1;
 
 public sealed class DomainRuleViolationException : Exception
 {
@@ -43,10 +47,19 @@ public enum OrderStatus { Created, Paid, Cancelled }
 
 public sealed class Order
 {
+    public Guid Id { get; } = Guid.NewGuid();
+    public string CustomerName { get; }
     private readonly List<OrderItem> _items = new();
     public IReadOnlyList<OrderItem> Items => _items;
     public OrderStatus Status { get; private set; } = OrderStatus.Created;
     public event EventHandler? OrderPaid;
+
+    public Order(string customerName)
+    {
+        if (string.IsNullOrWhiteSpace(customerName))
+            throw new ArgumentException("Customer name cannot be empty.", nameof(customerName));
+        CustomerName = customerName.Trim();
+    }
 
     public void AddItem(Product product, int quantity)
     {
@@ -79,42 +92,97 @@ public sealed class Order
     }
 }
 
+public sealed record OrderReport(
+    Guid OrderId,
+    string CustomerName,
+    decimal Total,
+    string Status,
+    int ItemsCount);
+
 internal static class Program
 {
     private static void Main()
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        var order = new Order();
-        order.OrderPaid += (_, _) => Console.WriteLine("EVENT: OrderPaid");
+        Console.WriteLine("LAB 7. Variant 1 - JSON, files and configuration\n");
 
-        Console.WriteLine("LAB 6. Variant 1 - Internet shop\n");
-
-        Execute("Correct operation: AddItem", () =>
+        try
         {
-            order.AddItem(new Product("Keyboard", 2499.00m), 2);
-            Console.WriteLine("Item added successfully.");
-        });
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: false)
+                .Build();
 
-        Execute("Invalid input: empty product name", () => _ = new Product("  ", 100m));
-        Execute("Invalid input: negative price", () => _ = new Product("Mouse", -1m));
-        Execute("Invalid input: zero quantity", () => order.AddItem(new Product("Monitor", 5000m), 0));
+            var relativePath = configuration["Storage:FilePath"]
+                ?? throw new InvalidOperationException("Storage:FilePath is not configured.");
+            var writeIndented = bool.TryParse(configuration["Storage:WriteIndented"], out var indented) && indented;
+            var filePath = Path.Combine(AppContext.BaseDirectory, relativePath);
 
-        Execute("Domain rule: pay empty order", () => new Order().Pay());
+            var orders = CreateOrders();
+            var reports = orders.Select(ToReport).ToList();
+            var options = new JsonSerializerOptions { WriteIndented = writeIndented };
+            var json = JsonSerializer.Serialize(reports, options);
 
-        Execute("Correct operation: Pay", order.Pay);
-        Execute("Invalid state: add item after payment", () =>
-            order.AddItem(new Product("USB cable", 199m), 1));
-        Execute("Invalid state: repeat payment", order.Pay);
+            var directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+            File.WriteAllText(filePath, json);
+            Console.WriteLine($"JSON saved to: {filePath}");
 
-        Console.WriteLine($"\nFinal status: {order.Status}");
-        Console.WriteLine($"Items count: {order.Items.Count}");
+            var savedJson = File.ReadAllText(filePath);
+            var restored = JsonSerializer.Deserialize<List<OrderReport>>(savedJson)
+                ?? throw new JsonException("The JSON file contains no report records.");
 
-        Console.Write("\nEnter an integer quantity (TryParse demonstration): ");
-        if (int.TryParse(Console.ReadLine(), out var quantity) && quantity > 0)
-            Console.WriteLine($"Accepted quantity: {quantity}");
-        else
-            Console.WriteLine("Error: enter a positive integer.");
+            Console.WriteLine("\nImported orders:");
+            foreach (var report in restored)
+                Console.WriteLine($"{report.CustomerName}: {report.Total:C} | {report.Status} | items: {report.ItemsCount}");
+            Console.WriteLine($"\nOrders count: {restored.Count}");
+            Console.WriteLine($"Total amount: {restored.Sum(x => x.Total):C}");
+        }
+        catch (FileNotFoundException)
+        {
+            Console.WriteLine("Error: the configuration or report file was not found.");
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"JSON error: {ex.Message}");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            Console.WriteLine("Error: access to the file was denied.");
+        }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"File error: {ex.Message}");
+        }
     }
+
+    private static List<Order> CreateOrders()
+    {
+        var data = new[]
+        {
+            ("Anna Kowalska", "Keyboard", 2499m, 2),
+            ("Piotr Nowak", "Mouse", 399m, 1),
+            ("Oleh Bondarenko", "Monitor", 1799m, 2),
+            ("Maria Zielinska", "Headphones", 599m, 3),
+            ("Jan Wozniak", "USB cable", 99m, 4)
+        };
+        var orders = new List<Order>();
+        foreach (var (customer, productName, price, quantity) in data)
+        {
+            var order = new Order(customer);
+            order.AddItem(new Product(productName, price), quantity);
+            order.Pay();
+            orders.Add(order);
+        }
+        return orders;
+    }
+
+    private static OrderReport ToReport(Order order) => new(
+        order.Id,
+        order.CustomerName,
+        order.Items.Sum(item => item.Product.Price * item.Quantity),
+        order.Status.ToString(),
+        order.Items.Sum(item => item.Quantity));
 
     private static void Execute(string title, Action operation)
     {
