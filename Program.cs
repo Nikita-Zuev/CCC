@@ -1,110 +1,33 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+using System.Diagnostics;
+using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 
-namespace Lab07Variant1;
+namespace Lab08Variant1;
 
-public sealed class DomainRuleViolationException : Exception
+public sealed record ExternalUser(int Id, string Name, string Email);
+
+public sealed class ExternalContactsClient : IDisposable
 {
-    public DomainRuleViolationException(string message) : base(message) { }
+    private readonly HttpClient _client;
+
+    public ExternalContactsClient(string baseUrl)
+    {
+        _client = new HttpClient { BaseAddress = new Uri(baseUrl) };
+    }
+
+    public Task<ExternalUser?> GetUserAsync(int id, CancellationToken token) =>
+        _client.GetFromJsonAsync<ExternalUser>($"users/{id}", token);
+
+    public void Dispose() => _client.Dispose();
 }
-
-public sealed class Product
-{
-    public string Name { get; }
-    public decimal Price { get; }
-
-    public Product(string name, decimal price)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-            throw new ArgumentException("Product name cannot be empty.", nameof(name));
-        if (price <= 0)
-            throw new ArgumentOutOfRangeException(nameof(price), "Price must be greater than zero.");
-
-        Name = name.Trim();
-        Price = price;
-    }
-}
-
-public sealed class OrderItem
-{
-    public Product Product { get; }
-    public int Quantity { get; }
-
-    public OrderItem(Product product, int quantity)
-    {
-        ArgumentNullException.ThrowIfNull(product);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(quantity);
-        Product = product;
-        Quantity = quantity;
-    }
-}
-
-public enum OrderStatus { Created, Paid, Cancelled }
-
-public sealed class Order
-{
-    public Guid Id { get; } = Guid.NewGuid();
-    public string CustomerName { get; }
-    private readonly List<OrderItem> _items = new();
-    public IReadOnlyList<OrderItem> Items => _items;
-    public OrderStatus Status { get; private set; } = OrderStatus.Created;
-    public event EventHandler? OrderPaid;
-
-    public Order(string customerName)
-    {
-        if (string.IsNullOrWhiteSpace(customerName))
-            throw new ArgumentException("Customer name cannot be empty.", nameof(customerName));
-        CustomerName = customerName.Trim();
-    }
-
-    public void AddItem(Product product, int quantity)
-    {
-        ArgumentNullException.ThrowIfNull(product);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(quantity);
-        EnsureCreated("Items can be changed only in a created order.");
-        _items.Add(new OrderItem(product, quantity));
-    }
-
-    public void Cancel()
-    {
-        EnsureCreated("Only a created order can be cancelled.");
-        Status = OrderStatus.Cancelled;
-    }
-
-    public void Pay()
-    {
-        EnsureCreated("Only a created order can be paid.");
-        if (_items.Count == 0)
-            throw new DomainRuleViolationException("An order must contain at least one item.");
-
-        Status = OrderStatus.Paid;
-        OrderPaid?.Invoke(this, EventArgs.Empty);
-    }
-
-    private void EnsureCreated(string message)
-    {
-        if (Status != OrderStatus.Created)
-            throw new InvalidOperationException(message);
-    }
-}
-
-public sealed record OrderReport(
-    Guid OrderId,
-    string CustomerName,
-    decimal Total,
-    string Status,
-    int ItemsCount);
 
 internal static class Program
 {
-    private static void Main()
+    private static async Task Main()
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        Console.WriteLine("LAB 7. Variant 1 - JSON, files and configuration\n");
+        Console.WriteLine("LAB 8. Variant 1 - Customer contacts\n");
 
         try
         {
@@ -112,100 +35,60 @@ internal static class Program
                 .SetBasePath(AppContext.BaseDirectory)
                 .AddJsonFile("appsettings.json", optional: false)
                 .Build();
+            var baseUrl = configuration["ExternalApi:BaseUrl"]
+                ?? throw new InvalidOperationException("ExternalApi:BaseUrl is not configured.");
 
-            var relativePath = configuration["Storage:FilePath"]
-                ?? throw new InvalidOperationException("Storage:FilePath is not configured.");
-            var writeIndented = bool.TryParse(configuration["Storage:WriteIndented"], out var indented) && indented;
-            var filePath = Path.Combine(AppContext.BaseDirectory, relativePath);
+            using var contactsClient = new ExternalContactsClient(baseUrl);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            Console.WriteLine("Loading external customer contacts...");
 
-            var orders = CreateOrders();
-            var reports = orders.Select(ToReport).ToList();
-            var options = new JsonSerializerOptions { WriteIndented = writeIndented };
-            var json = JsonSerializer.Serialize(reports, options);
+            var stopwatch = Stopwatch.StartNew();
+            var tasks = Enumerable.Range(1, 3)
+                .Select(id => contactsClient.GetUserAsync(id, timeout.Token))
+                .ToArray();
+            var contacts = (await Task.WhenAll(tasks)).Where(x => x is not null).Cast<ExternalUser>().ToArray();
+            stopwatch.Stop();
 
-            var directory = Path.GetDirectoryName(filePath);
-            if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
-            File.WriteAllText(filePath, json);
-            Console.WriteLine($"JSON saved to: {filePath}");
+            Console.WriteLine($"Received: {contacts.Length}");
+            Console.WriteLine("\nCustomer contacts:");
+            foreach (var contact in contacts)
+                Console.WriteLine($"{contact.Id} | {contact.Name} | {contact.Email}");
+            Console.WriteLine($"\nConcurrent request time: {stopwatch.ElapsedMilliseconds} ms");
+            Console.WriteLine("No Customer or Order entities were created automatically.");
 
-            var savedJson = File.ReadAllText(filePath);
-            var restored = JsonSerializer.Deserialize<List<OrderReport>>(savedJson)
-                ?? throw new JsonException("The JSON file contains no report records.");
-
-            Console.WriteLine("\nImported orders:");
-            foreach (var report in restored)
-                Console.WriteLine($"{report.CustomerName}: {report.Total:C} | {report.Status} | items: {report.ItemsCount}");
-            Console.WriteLine($"\nOrders count: {restored.Count}");
-            Console.WriteLine($"Total amount: {restored.Sum(x => x.Total):C}");
+            await CompareRequestModesAsync(contactsClient, timeout.Token);
         }
-        catch (FileNotFoundException)
+        catch (OperationCanceledException)
         {
-            Console.WriteLine("Error: the configuration or report file was not found.");
+            Console.WriteLine("Request cancelled or timed out.");
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"HTTP error: {ex.Message}");
         }
         catch (JsonException ex)
         {
             Console.WriteLine($"JSON error: {ex.Message}");
         }
-        catch (UnauthorizedAccessException)
+        catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException)
         {
-            Console.WriteLine("Error: access to the file was denied.");
-        }
-        catch (IOException ex)
-        {
-            Console.WriteLine($"File error: {ex.Message}");
+            Console.WriteLine($"Configuration error: {ex.Message}");
         }
     }
 
-    private static List<Order> CreateOrders()
+    private static async Task CompareRequestModesAsync(ExternalContactsClient client, CancellationToken token)
     {
-        var data = new[]
-        {
-            ("Anna Kowalska", "Keyboard", 2499m, 2),
-            ("Piotr Nowak", "Mouse", 399m, 1),
-            ("Oleh Bondarenko", "Monitor", 1799m, 2),
-            ("Maria Zielinska", "Headphones", 599m, 3),
-            ("Jan Wozniak", "USB cable", 99m, 4)
-        };
-        var orders = new List<Order>();
-        foreach (var (customer, productName, price, quantity) in data)
-        {
-            var order = new Order(customer);
-            order.AddItem(new Product(productName, price), quantity);
-            order.Pay();
-            orders.Add(order);
-        }
-        return orders;
-    }
+        var sequentialTimer = Stopwatch.StartNew();
+        foreach (var id in Enumerable.Range(1, 3))
+            await client.GetUserAsync(id, token);
+        sequentialTimer.Stop();
 
-    private static OrderReport ToReport(Order order) => new(
-        order.Id,
-        order.CustomerName,
-        order.Items.Sum(item => item.Product.Price * item.Quantity),
-        order.Status.ToString(),
-        order.Items.Sum(item => item.Quantity));
+        var concurrentTimer = Stopwatch.StartNew();
+        await Task.WhenAll(Enumerable.Range(1, 3).Select(id => client.GetUserAsync(id, token)));
+        concurrentTimer.Stop();
 
-    private static void Execute(string title, Action operation)
-    {
-        Console.WriteLine($"\n{title}");
-        try
-        {
-            operation();
-        }
-        catch (ArgumentException ex)
-        {
-            Console.WriteLine($"Argument error: {ex.Message}");
-        }
-        catch (DomainRuleViolationException ex)
-        {
-            Console.WriteLine($"Domain error: {ex.Message}");
-        }
-        catch (InvalidOperationException ex)
-        {
-            Console.WriteLine($"State error: {ex.Message}");
-        }
-        finally
-        {
-            Console.WriteLine("Operation finished.");
-        }
+        Console.WriteLine($"Sequential requests: {sequentialTimer.ElapsedMilliseconds} ms");
+        Console.WriteLine($"Task.WhenAll requests: {concurrentTimer.ElapsedMilliseconds} ms");
+        Console.WriteLine("Measurements may differ because of network latency, server load and caching.");
     }
 }
